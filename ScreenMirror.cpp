@@ -4,6 +4,7 @@
 #include "framework.h"
 #include "ScreenMirror.h"
 #include "DwmThumbnailInterop.h"
+#include "SharedMemory.h"
 
 #define MAX_LOADSTRING 100
 
@@ -22,9 +23,7 @@ RECT g_sourceRect = {0};                        // Source window region to captu
 BOOL g_bUseSourceRect = FALSE;                  // Flag to use custom source rectangle
 RECT g_hiddenWindowRect = {0};                  // Store window position when hidden (off-screen position)
 BOOL g_bWindowHidden = FALSE;                   // Flag to track if window is hidden (moved off-screen)
-HHOOK g_hKeyboardHook = NULL;                    // Global keyboard hook handle
-HWND g_hMainWnd = NULL;                          // Main window handle for hook messages
-#define WM_TOGGLE_VISIBILITY (WM_USER + 1)       // Custom message for toggle visibility
+UINT_PTR g_sharedMemoryTimerId = 0;            // Timer ID for checking shared memory
 
 // Forward declarations of functions included in this code module:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -35,9 +34,6 @@ void                ExitFullscreen(HWND hWnd);
 BOOL                GetFirstDisplayInfo(RECT* pRect);
 HWND                FindGameExeWindow();
 void                SetupThumbnail(HWND hWnd, HWND hSourceWnd);
-LRESULT CALLBACK    LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
-BOOL                InstallKeyboardHook();
-void                UninstallKeyboardHook();
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
@@ -68,7 +64,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     }
 
     // Cleanup
-    UninstallKeyboardHook();
+    CloseSharedMemory();
     
     if (g_hThumbnail != NULL)
     {
@@ -134,14 +130,11 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
    ShowWindow(hWnd, nCmdShow);
    UpdateWindow(hWnd);
 
-   // Store main window handle for hook
-   g_hMainWnd = hWnd;
+   // Open shared memory
+   OpenSharedMemory();
    
-   // Install global keyboard hook
-   if (!InstallKeyboardHook())
-   {
-       // Hook installation failed, but continue anyway
-   }
+   // Start timer to check shared memory messages (check every 100ms)
+   g_sharedMemoryTimerId = SetTimer(hWnd, 2, 100, NULL);
 
    return TRUE;
 }
@@ -187,42 +180,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             }
         }
         break;
-    case WM_TOGGLE_VISIBILITY:
+    case WM_TIMER:
         {
-            // Toggle window hide/show by moving off-screen (triggered by global keyboard hook)
-            if (g_bWindowHidden)
+            // Check shared memory for messages
+            if (wParam == 2) // Shared memory check timer
             {
-                // Show: restore original position
-                SetWindowPos(hWnd, NULL,
-                           g_hiddenWindowRect.left,
-                           g_hiddenWindowRect.top,
-                           0, 0,
-                           SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                g_bWindowHidden = FALSE;
+                char message[MAX_MESSAGE_LENGTH] = {0};
+                if (CheckSharedMemoryMessage(message))
+                {
+                    if (strcmp(message, "SHOW2ND") == 0)
+                    {
+                        ShowWindowByMessage(hWnd);
+                    }
+                    else if (strcmp(message, "HIDE2ND") == 0)
+                    {
+                        HideWindowByMessage(hWnd);
+                    }
+                }
             }
             else
             {
-                // Hide: store current position and move off-screen
-                RECT currentRect;
-                GetWindowRect(hWnd, &currentRect);
-                
-                // Store current position for restoration
-                g_hiddenWindowRect = currentRect;
-                
-                // Get virtual screen dimensions (covers all monitors) to move window completely off-screen
-                int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-                int virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-                int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-                int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
-                
-                // Move window to off-screen position (outside all displays)
-                // Use negative coordinates relative to virtual screen origin
-                SetWindowPos(hWnd, NULL,
-                           virtualLeft - virtualWidth - 100,
-                           virtualTop - virtualHeight - 100,
-                           0, 0,
-                           SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                g_bWindowHidden = TRUE;
+                // Other timer messages (if any)
             }
         }
         break;
@@ -237,8 +215,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         break;
     case WM_DESTROY:
         {
-            // Uninstall keyboard hook
-            UninstallKeyboardHook();
+            // Kill shared memory check timer
+            if (g_sharedMemoryTimerId != 0)
+            {
+                KillTimer(hWnd, g_sharedMemoryTimerId);
+                g_sharedMemoryTimerId = 0;
+            }
+            
+            // Close shared memory
+            CloseSharedMemory();
             
             if (g_hThumbnail != NULL)
             {
@@ -724,52 +709,3 @@ void ExitFullscreen(HWND hWnd)
     }
 }
 
-// Low-level keyboard hook procedure
-LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
-{
-    if (nCode >= 0)
-    {
-        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
-        {
-            KBDLLHOOKSTRUCT* pKbd = (KBDLLHOOKSTRUCT*)lParam;
-            
-            // Check if numpad 8 was pressed
-            if (pKbd->vkCode == VK_NUMPAD8)
-            {
-                // Post custom message to main window to toggle visibility
-                if (g_hMainWnd != NULL && IsWindow(g_hMainWnd))
-                {
-                    PostMessage(g_hMainWnd, WM_TOGGLE_VISIBILITY, 0, 0);
-                }
-            }
-        }
-    }
-    
-    // Call next hook
-    return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
-}
-
-// Install global keyboard hook
-BOOL InstallKeyboardHook()
-{
-    if (g_hKeyboardHook != NULL)
-        return TRUE; // Already installed
-    
-    // Install low-level keyboard hook
-    g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, 
-                                       LowLevelKeyboardProc, 
-                                       hInst, 
-                                       0);
-    
-    return (g_hKeyboardHook != NULL);
-}
-
-// Uninstall global keyboard hook
-void UninstallKeyboardHook()
-{
-    if (g_hKeyboardHook != NULL)
-    {
-        UnhookWindowsHookEx(g_hKeyboardHook);
-        g_hKeyboardHook = NULL;
-    }
-}
