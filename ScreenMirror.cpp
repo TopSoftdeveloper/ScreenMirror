@@ -226,9 +226,8 @@ BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam)
     WCHAR szWindowText[1024] = {0};
     GetWindowTextW(hWnd, szWindowText, ARRAYSIZE(szWindowText) - 1);
     
-    // Ignore untitled windows
-    if (wcslen(szWindowText) == 0)
-        return TRUE;
+    // Use process name as fallback if window has no title
+    // (We'll set the title later after getting process info)
 
     // Ignore the picker dialog itself and its parent
     HWND hPickerDlg = (HWND)lParam;
@@ -284,8 +283,17 @@ BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam)
         window.hWnd = hWnd;
         
         // Format: "Window Title (ProcessName.exe) [Width x Height]" - showing client size
+        // If window has no title, use "(Untitled)" or process name
         std::wostringstream oss;
-        oss << szWindowText << L" (" << pszName << L") [" << clientWidth << L" x " << clientHeight << L"]";
+        if (wcslen(szWindowText) > 0)
+        {
+            oss << szWindowText << L" (" << pszName << L") [" << clientWidth << L" x " << clientHeight << L"]";
+        }
+        else
+        {
+            // Show as untitled window with process name
+            oss << L"(Untitled - " << pszName << L") [" << clientWidth << L" x " << clientHeight << L"]";
+        }
         window.name = oss.str();
         g_windowsList.push_back(window);
     }
