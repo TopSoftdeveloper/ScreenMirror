@@ -20,6 +20,11 @@ RECT g_normalWindowRect = {0};                  // Store normal window position 
 DWORD g_normalWindowStyle = 0;                  // Store normal window style
 RECT g_sourceRect = {0};                        // Source window region to capture (0 = use full window)
 BOOL g_bUseSourceRect = FALSE;                  // Flag to use custom source rectangle
+RECT g_hiddenWindowRect = {0};                  // Store window position when hidden (off-screen position)
+BOOL g_bWindowHidden = FALSE;                   // Flag to track if window is hidden (moved off-screen)
+HHOOK g_hKeyboardHook = NULL;                    // Global keyboard hook handle
+HWND g_hMainWnd = NULL;                          // Main window handle for hook messages
+#define WM_TOGGLE_VISIBILITY (WM_USER + 1)       // Custom message for toggle visibility
 
 // Forward declarations of functions included in this code module:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -28,6 +33,11 @@ LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
 void                EnterFullscreen(HWND hWnd);
 void                ExitFullscreen(HWND hWnd);
 BOOL                GetFirstDisplayInfo(RECT* pRect);
+HWND                FindGameExeWindow();
+void                SetupThumbnail(HWND hWnd, HWND hSourceWnd);
+LRESULT CALLBACK    LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
+BOOL                InstallKeyboardHook();
+void                UninstallKeyboardHook();
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
@@ -57,7 +67,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         DispatchMessage(&msg);
     }
 
-    // Cleanup thumbnail if exists
+    // Cleanup
+    UninstallKeyboardHook();
+    
     if (g_hThumbnail != NULL)
     {
         DwmUnregisterThumbnail(g_hThumbnail);
@@ -122,6 +134,15 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
    ShowWindow(hWnd, nCmdShow);
    UpdateWindow(hWnd);
 
+   // Store main window handle for hook
+   g_hMainWnd = hWnd;
+   
+   // Install global keyboard hook
+   if (!InstallKeyboardHook())
+   {
+       // Hook installation failed, but continue anyway
+   }
+
    return TRUE;
 }
 
@@ -136,46 +157,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
     case WM_CREATE:
         {
-            // Pick window on creation
-            HWND hSelectedWnd = NULL;
-            if (PickCaptureTarget(hWnd, &hSelectedWnd) && hSelectedWnd != NULL)
+            // First, try to auto-detect game.exe window with no title
+            HWND hSelectedWnd = FindGameExeWindow();
+            
+            // If not found, show picker dialog
+            if (hSelectedWnd == NULL)
             {
-                g_hSourceWnd = hSelectedWnd;
-                
-                // Get source window client size to match our window size
-                RECT sourceClientRect;
-                if (GetClientRect(hSelectedWnd, &sourceClientRect))
+                if (!PickCaptureTarget(hWnd, &hSelectedWnd) || hSelectedWnd == NULL)
                 {
-                    // Use client size directly since our window is borderless (client = window)
-                    int clientWidth = sourceClientRect.right - sourceClientRect.left;
-                    int clientHeight = sourceClientRect.bottom - sourceClientRect.top;
-                    
-                    // Get current window position
-                    RECT currentRect;
-                    GetWindowRect(hWnd, &currentRect);
-                    
-                    // Resize window to match source window client size
-                    // Since our window is borderless (WS_POPUP), client size = window size
-                    SetWindowPos(hWnd, NULL, 
-                               currentRect.left, 
-                               currentRect.top,
-                               clientWidth, 
-                               clientHeight,
-                               SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
-                }
-                
-                // Register DWM thumbnail
-                HRESULT hr = DwmRegisterThumbnail(hWnd, hSelectedWnd, &g_hThumbnail);
-                if (SUCCEEDED(hr))
-                {
-                    UpdateThumbnailProperties(hWnd, g_hThumbnail, hSelectedWnd);
+                    // User cancelled or no window selected, close application
+                    PostMessage(hWnd, WM_CLOSE, 0, 0);
+                    break;
                 }
             }
-            else
-            {
-                // User cancelled or no window selected, close application
-                PostMessage(hWnd, WM_CLOSE, 0, 0);
-            }
+            
+            // Setup thumbnail for selected window
+            SetupThumbnail(hWnd, hSelectedWnd);
         }
         break;
     case WM_KEYDOWN:
@@ -190,6 +187,45 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             }
         }
         break;
+    case WM_TOGGLE_VISIBILITY:
+        {
+            // Toggle window hide/show by moving off-screen (triggered by global keyboard hook)
+            if (g_bWindowHidden)
+            {
+                // Show: restore original position
+                SetWindowPos(hWnd, NULL,
+                           g_hiddenWindowRect.left,
+                           g_hiddenWindowRect.top,
+                           0, 0,
+                           SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                g_bWindowHidden = FALSE;
+            }
+            else
+            {
+                // Hide: store current position and move off-screen
+                RECT currentRect;
+                GetWindowRect(hWnd, &currentRect);
+                
+                // Store current position for restoration
+                g_hiddenWindowRect = currentRect;
+                
+                // Get virtual screen dimensions (covers all monitors) to move window completely off-screen
+                int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                int virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                
+                // Move window to off-screen position (outside all displays)
+                // Use negative coordinates relative to virtual screen origin
+                SetWindowPos(hWnd, NULL,
+                           virtualLeft - virtualWidth - 100,
+                           virtualTop - virtualHeight - 100,
+                           0, 0,
+                           SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                g_bWindowHidden = TRUE;
+            }
+        }
+        break;
     case WM_SIZE:
         {
             // Update thumbnail properties when window size changes
@@ -201,6 +237,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         break;
     case WM_DESTROY:
         {
+            // Uninstall keyboard hook
+            UninstallKeyboardHook();
+            
             if (g_hThumbnail != NULL)
             {
                 DwmUnregisterThumbnail(g_hThumbnail);
@@ -433,6 +472,117 @@ INT_PTR CALLBACK WindowPickerDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPA
     return (INT_PTR)FALSE;
 }
 
+// Helper structure for game.exe window search
+struct GameWindowSearchData {
+    HWND hFoundWindow;
+};
+
+// Callback to find game.exe window with no title
+BOOL CALLBACK FindGameExeWindowProc(HWND hWnd, LPARAM lParam)
+{
+    // Ignore invisible windows
+    if (!IsWindowVisible(hWnd))
+        return TRUE;
+
+    // Get window title - we want windows with no title
+    WCHAR szWindowText[1024] = {0};
+    GetWindowTextW(hWnd, szWindowText, ARRAYSIZE(szWindowText) - 1);
+    
+    // Must have no title
+    if (wcslen(szWindowText) > 0)
+        return TRUE;
+
+    // Get process information
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hWnd, &processId);
+    
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+    if (hProcess == NULL)
+        return TRUE;
+
+    WCHAR szProcessName[MAX_PATH] = {0};
+    DWORD dwSize = ARRAYSIZE(szProcessName);
+    BOOL found = FALSE;
+    
+    if (QueryFullProcessImageNameW(hProcess, 0, szProcessName, &dwSize))
+    {
+        // Extract process name from full path
+        WCHAR* pszName = wcsrchr(szProcessName, L'\\');
+        if (pszName != NULL)
+            pszName++;
+        else
+            pszName = szProcessName;
+
+        // Check if it's game.exe (case insensitive)
+        WCHAR szLowerName[MAX_PATH] = {0};
+        for (int i = 0; pszName[i]; i++)
+            szLowerName[i] = towlower(pszName[i]);
+
+        if (wcscmp(szLowerName, L"game.exe") == 0)
+        {
+            GameWindowSearchData* pData = (GameWindowSearchData*)lParam;
+            if (pData != NULL)
+            {
+                pData->hFoundWindow = hWnd;
+                found = TRUE;
+            }
+        }
+    }
+
+    CloseHandle(hProcess);
+    return found ? FALSE : TRUE; // Stop enumeration if found
+}
+
+// Find game.exe window with no title
+HWND FindGameExeWindow()
+{
+    GameWindowSearchData searchData;
+    searchData.hFoundWindow = NULL;
+    
+    // Enumerate windows to find game.exe with no title
+    EnumWindows(FindGameExeWindowProc, (LPARAM)&searchData);
+    
+    return searchData.hFoundWindow;
+}
+
+// Setup thumbnail for a source window
+void SetupThumbnail(HWND hWnd, HWND hSourceWnd)
+{
+    if (hSourceWnd == NULL)
+        return;
+    
+    g_hSourceWnd = hSourceWnd;
+    
+    // Get source window client size to match our window size
+    RECT sourceClientRect;
+    if (GetClientRect(hSourceWnd, &sourceClientRect))
+    {
+        // Use client size directly since our window is borderless (client = window)
+        int clientWidth = sourceClientRect.right - sourceClientRect.left;
+        int clientHeight = sourceClientRect.bottom - sourceClientRect.top;
+        
+        // Get current window position
+        RECT currentRect;
+        GetWindowRect(hWnd, &currentRect);
+        
+        // Resize window to match source window client size
+        // Since our window is borderless (WS_POPUP), client size = window size
+        SetWindowPos(hWnd, NULL, 
+                   currentRect.left, 
+                   currentRect.top,
+                   clientWidth, 
+                   clientHeight,
+                   SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+    
+    // Register DWM thumbnail
+    HRESULT hr = DwmRegisterThumbnail(hWnd, hSourceWnd, &g_hThumbnail);
+    if (SUCCEEDED(hr))
+    {
+        UpdateThumbnailProperties(hWnd, g_hThumbnail, hSourceWnd);
+    }
+}
+
 // Pick capture target window
 BOOL PickCaptureTarget(HWND hOwnerWnd, HWND* phSelectedWnd)
 {
@@ -571,5 +721,55 @@ void ExitFullscreen(HWND hWnd)
     if (g_hThumbnail != NULL && g_hSourceWnd != NULL)
     {
         UpdateThumbnailProperties(hWnd, g_hThumbnail, g_hSourceWnd);
+    }
+}
+
+// Low-level keyboard hook procedure
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+    if (nCode >= 0)
+    {
+        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
+        {
+            KBDLLHOOKSTRUCT* pKbd = (KBDLLHOOKSTRUCT*)lParam;
+            
+            // Check if numpad 8 was pressed
+            if (pKbd->vkCode == VK_NUMPAD8)
+            {
+                // Post custom message to main window to toggle visibility
+                if (g_hMainWnd != NULL && IsWindow(g_hMainWnd))
+                {
+                    PostMessage(g_hMainWnd, WM_TOGGLE_VISIBILITY, 0, 0);
+                }
+            }
+        }
+    }
+    
+    // Call next hook
+    return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
+}
+
+// Install global keyboard hook
+BOOL InstallKeyboardHook()
+{
+    if (g_hKeyboardHook != NULL)
+        return TRUE; // Already installed
+    
+    // Install low-level keyboard hook
+    g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, 
+                                       LowLevelKeyboardProc, 
+                                       hInst, 
+                                       0);
+    
+    return (g_hKeyboardHook != NULL);
+}
+
+// Uninstall global keyboard hook
+void UninstallKeyboardHook()
+{
+    if (g_hKeyboardHook != NULL)
+    {
+        UnhookWindowsHookEx(g_hKeyboardHook);
+        g_hKeyboardHook = NULL;
     }
 }
