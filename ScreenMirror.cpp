@@ -15,11 +15,19 @@ HTHUMBNAIL g_hThumbnail = NULL;                 // DWM thumbnail handle
 HWND g_hSourceWnd = NULL;                       // Source window handle
 std::vector<CapturableWindow> g_windowsList;    // List of windows for picker dialog
 HWND g_hSelectedWindow = NULL;                  // Selected window from picker dialog
+BOOL g_bFullscreen = FALSE;                     // Flag for fullscreen state
+RECT g_normalWindowRect = {0};                  // Store normal window position and size
+DWORD g_normalWindowStyle = 0;                  // Store normal window style
+RECT g_sourceRect = {0};                        // Source window region to capture (0 = use full window)
+BOOL g_bUseSourceRect = FALSE;                  // Flag to use custom source rectangle
 
 // Forward declarations of functions included in this code module:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
 LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
+void                EnterFullscreen(HWND hWnd);
+void                ExitFullscreen(HWND hWnd);
+BOOL                GetFirstDisplayInfo(RECT* pRect);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
@@ -98,8 +106,9 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
    int windowWidth = 800;
    int windowHeight = 600;
    
+   // Create window without title bar (borderless window)
    HWND hWnd = CreateWindowW(szWindowClass, szTitle, 
-      WS_OVERLAPPEDWINDOW,
+      WS_POPUP | WS_VISIBLE,  // No title bar, no borders
       CW_USEDEFAULT, 0,
       windowWidth,
       windowHeight,
@@ -133,6 +142,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             {
                 g_hSourceWnd = hSelectedWnd;
                 
+                // Get source window client size to match our window size
+                RECT sourceClientRect;
+                if (GetClientRect(hSelectedWnd, &sourceClientRect))
+                {
+                    // Use client size directly since our window is borderless (client = window)
+                    int clientWidth = sourceClientRect.right - sourceClientRect.left;
+                    int clientHeight = sourceClientRect.bottom - sourceClientRect.top;
+                    
+                    // Get current window position
+                    RECT currentRect;
+                    GetWindowRect(hWnd, &currentRect);
+                    
+                    // Resize window to match source window client size
+                    // Since our window is borderless (WS_POPUP), client size = window size
+                    SetWindowPos(hWnd, NULL, 
+                               currentRect.left, 
+                               currentRect.top,
+                               clientWidth, 
+                               clientHeight,
+                               SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                }
+                
                 // Register DWM thumbnail
                 HRESULT hr = DwmRegisterThumbnail(hWnd, hSelectedWnd, &g_hThumbnail);
                 if (SUCCEEDED(hr))
@@ -144,6 +175,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             {
                 // User cancelled or no window selected, close application
                 PostMessage(hWnd, WM_CLOSE, 0, 0);
+            }
+        }
+        break;
+    case WM_KEYDOWN:
+        {
+            // Press numpad 0 to enter/exit fullscreen
+            if (wParam == VK_NUMPAD0)
+            {
+                if (g_bFullscreen)
+                    ExitFullscreen(hWnd);
+                else
+                    EnterFullscreen(hWnd);
             }
         }
         break;
@@ -226,10 +269,24 @@ BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam)
             return TRUE;
         }
 
-        // Add window to list
+        // Get window client size (content area without borders/title bar)
+        RECT clientRect;
+        int clientWidth = 0;
+        int clientHeight = 0;
+        if (GetClientRect(hWnd, &clientRect))
+        {
+            clientWidth = clientRect.right - clientRect.left;
+            clientHeight = clientRect.bottom - clientRect.top;
+        }
+
+        // Add window to list with size information
         CapturableWindow window;
         window.hWnd = hWnd;
-        window.name = std::wstring(szWindowText) + L" (" + std::wstring(pszName) + L")";
+        
+        // Format: "Window Title (ProcessName.exe) [Width x Height]" - showing client size
+        std::wostringstream oss;
+        oss << szWindowText << L" (" << pszName << L") [" << clientWidth << L" x " << clientHeight << L"]";
+        window.name = oss.str();
         g_windowsList.push_back(window);
     }
 
@@ -386,4 +443,125 @@ BOOL PickCaptureTarget(HWND hOwnerWnd, HWND* phSelectedWnd)
     }
 
     return FALSE;
+}
+
+// Wrapper structure for monitor enumeration
+struct MonitorEnumData {
+    RECT* pRect;
+    BOOL found;
+};
+
+// Monitor enumeration callback (internal version)
+BOOL CALLBACK MonitorEnumProcInternal(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM dwData)
+{
+    UNREFERENCED_PARAMETER(hdcMonitor);
+    UNREFERENCED_PARAMETER(lprcMonitor);
+    
+    MonitorEnumData* pData = (MonitorEnumData*)dwData;
+    if (pData == NULL || pData->pRect == NULL)
+        return FALSE;
+    
+    // Get complete monitor information including full screen area
+    MONITORINFO monitorInfo;
+    monitorInfo.cbSize = sizeof(MONITORINFO);
+    
+    if (GetMonitorInfo(hMonitor, &monitorInfo))
+    {
+        // Use rcMonitor to get the complete monitor rectangle (not just work area)
+        *(pData->pRect) = monitorInfo.rcMonitor;
+        pData->found = TRUE;
+        return FALSE; // Stop enumeration after first monitor
+    }
+    
+    return TRUE; // Continue enumeration
+}
+
+// Function to get 1st display monitor information
+BOOL GetFirstDisplayInfo(RECT* pRect)
+{
+    if (pRect == NULL)
+        return FALSE;
+    
+    ZeroMemory(pRect, sizeof(RECT));
+    
+    MonitorEnumData data;
+    data.pRect = pRect;
+    data.found = FALSE;
+    
+    // Enumerate all monitors
+    EnumDisplayMonitors(NULL, NULL, MonitorEnumProcInternal, (LPARAM)&data);
+    
+    // Check if we got a valid rect
+    return data.found && (pRect->right > pRect->left && pRect->bottom > pRect->top);
+}
+
+// Function to enter fullscreen mode
+void EnterFullscreen(HWND hWnd)
+{
+    if (g_bFullscreen)
+        return; // Already in fullscreen
+    
+    // Store current window state
+    GetWindowRect(hWnd, &g_normalWindowRect);
+    g_normalWindowStyle = (DWORD)GetWindowLongPtr(hWnd, GWL_STYLE);
+    
+    // Get display dimensions
+    RECT displayRect;
+    if (!GetFirstDisplayInfo(&displayRect))
+    {
+        // Fallback to primary monitor
+        displayRect.left = 0;
+        displayRect.top = 0;
+        displayRect.right = GetSystemMetrics(SM_CXSCREEN);
+        displayRect.bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
+    
+    int screenWidth = displayRect.right - displayRect.left;
+    int screenHeight = displayRect.bottom - displayRect.top;
+    
+    // Remove window decorations
+    SetWindowLongPtr(hWnd, GWL_STYLE, 
+        WS_POPUP | WS_VISIBLE);
+    
+    // Set window to cover entire display
+    SetWindowPos(hWnd, HWND_TOP,
+        displayRect.left,
+        displayRect.top,
+        screenWidth,
+        screenHeight,
+        SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    
+    g_bFullscreen = TRUE;
+    
+    // Update thumbnail properties after fullscreen
+    if (g_hThumbnail != NULL && g_hSourceWnd != NULL)
+    {
+        UpdateThumbnailProperties(hWnd, g_hThumbnail, g_hSourceWnd);
+    }
+}
+
+// Function to exit fullscreen mode
+void ExitFullscreen(HWND hWnd)
+{
+    if (!g_bFullscreen)
+        return; // Already in windowed mode
+    
+    // Restore window style (borderless without title bar)
+    SetWindowLongPtr(hWnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+    
+    // Restore window position and size
+    SetWindowPos(hWnd, HWND_TOP,
+        g_normalWindowRect.left,
+        g_normalWindowRect.top,
+        g_normalWindowRect.right - g_normalWindowRect.left,
+        g_normalWindowRect.bottom - g_normalWindowRect.top,
+        SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    
+    g_bFullscreen = FALSE;
+    
+    // Update thumbnail properties after exiting fullscreen
+    if (g_hThumbnail != NULL && g_hSourceWnd != NULL)
+    {
+        UpdateThumbnailProperties(hWnd, g_hThumbnail, g_hSourceWnd);
+    }
 }
