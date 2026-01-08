@@ -14,6 +14,8 @@
 #define IDI_SMALL				108
 #define IDC_SCREENMIRROR			109
 #define IDC_MYICON				2
+#define IDD_WINDOWPICKER			110
+#define IDC_LIST_WINDOWS			1000
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1
 #endif

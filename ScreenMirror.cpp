@@ -3,6 +3,7 @@
 
 #include "framework.h"
 #include "ScreenMirror.h"
+#include "DwmThumbnailInterop.h"
 
 #define MAX_LOADSTRING 100
 
@@ -10,16 +11,15 @@
 HINSTANCE hInst;                                // current instance
 WCHAR szTitle[MAX_LOADSTRING];                  // The title bar text
 WCHAR szWindowClass[MAX_LOADSTRING];            // the main window class name
-RECT g_firstDisplayRect = {0};                   // 1st display rectangle
-BOOL g_bFirstDisplayFound = FALSE;               // Flag if 1st display found
-UINT_PTR g_timerId = 0;                         // Timer ID for screen capture
+HTHUMBNAIL g_hThumbnail = NULL;                 // DWM thumbnail handle
+HWND g_hSourceWnd = NULL;                       // Source window handle
+std::vector<CapturableWindow> g_windowsList;    // List of windows for picker dialog
+HWND g_hSelectedWindow = NULL;                  // Selected window from picker dialog
 
 // Forward declarations of functions included in this code module:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
 LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
-BOOL                GetFirstDisplayInfo(RECT* pRect);
-BOOL                CaptureScreen(HWND hWnd, HDC hdcDest, RECT* pSourceRect);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
@@ -28,8 +28,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 {
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
-
-    // TODO: Place code here.
 
     // Initialize global strings
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
@@ -51,10 +49,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         DispatchMessage(&msg);
     }
 
+    // Cleanup thumbnail if exists
+    if (g_hThumbnail != NULL)
+    {
+        DwmUnregisterThumbnail(g_hThumbnail);
+        g_hThumbnail = NULL;
+    }
+
     return (int) msg.wParam;
 }
-
-
 
 //
 //  FUNCTION: MyRegisterClass()
@@ -87,38 +90,17 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
 //
 //   PURPOSE: Saves instance handle and creates main window
 //
-//   COMMENTS:
-//
-//        In this function, we save the instance handle in a global variable and
-//        create and display the main program window.
-//
 BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 {
    hInst = hInstance; // Store instance handle in our global variable
 
-   // Get 1st display information
-   if (!GetFirstDisplayInfo(&g_firstDisplayRect))
-   {
-       MessageBox(NULL, L"First display not found!", 
-                  L"Error", MB_OK | MB_ICONERROR);
-       return FALSE;
-   }
-
-   // Create window with title bar and borders (movable and resizable)
-   // Start with a reasonable default size (e.g., 80% of display)
-   int displayWidth = g_firstDisplayRect.right - g_firstDisplayRect.left;
-   int displayHeight = g_firstDisplayRect.bottom - g_firstDisplayRect.top;
-   int windowWidth = displayWidth * 8 / 10;
-   int windowHeight = displayHeight * 8 / 10;
-   
-   // Center the window on the display
-   int windowX = g_firstDisplayRect.left + (displayWidth - windowWidth) / 2;
-   int windowY = g_firstDisplayRect.top + (displayHeight - windowHeight) / 2;
+   // Create window
+   int windowWidth = 800;
+   int windowHeight = 600;
    
    HWND hWnd = CreateWindowW(szWindowClass, szTitle, 
-      WS_OVERLAPPEDWINDOW,  // Title bar, borders, and resize capability
-      windowX, 
-      windowY,
+      WS_OVERLAPPEDWINDOW,
+      CW_USEDEFAULT, 0,
       windowWidth,
       windowHeight,
       nullptr, nullptr, hInstance, nullptr);
@@ -131,9 +113,6 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
    ShowWindow(hWnd, nCmdShow);
    UpdateWindow(hWnd);
 
-   // Start timer for real-time screen capture (30 FPS = ~33ms)
-   g_timerId = SetTimer(hWnd, 1, 33, NULL);
-
    return TRUE;
 }
 
@@ -142,57 +121,50 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 //
 //  PURPOSE: Processes messages for the main window.
 //
-//  WM_KEYDOWN  - Exit on ESC key
-//  WM_TIMER    - Trigger screen capture update
-//  WM_PAINT    - Capture and display 2nd display screen
-//  WM_DESTROY  - Clean up and exit
-//
-//
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
     {
-    case WM_KEYDOWN:
+    case WM_CREATE:
         {
-            // Press ESC to exit fullscreen
-            if (wParam == VK_ESCAPE)
+            // Pick window on creation
+            HWND hSelectedWnd = NULL;
+            if (PickCaptureTarget(hWnd, &hSelectedWnd) && hSelectedWnd != NULL)
             {
-                DestroyWindow(hWnd);
-            }
-        }
-        break;
-    case WM_TIMER:
-        {
-            // Trigger repaint for screen capture
-            InvalidateRect(hWnd, NULL, FALSE);
-        }
-        break;
-    case WM_PAINT:
-        {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hWnd, &ps);
-            
-            if (g_bFirstDisplayFound)
-            {
-                // Capture and display the entire 1st display screen
-                // This captures the complete display area including all pixels
-                CaptureScreen(hWnd, hdc, &g_firstDisplayRect);
+                g_hSourceWnd = hSelectedWnd;
+                
+                // Register DWM thumbnail
+                HRESULT hr = DwmRegisterThumbnail(hWnd, hSelectedWnd, &g_hThumbnail);
+                if (SUCCEEDED(hr))
+                {
+                    UpdateThumbnailProperties(hWnd, g_hThumbnail, hSelectedWnd);
+                }
             }
             else
             {
-                // Fallback: show error message
-                TextOut(hdc, 10, 10, L"First display not found!", 25);
+                // User cancelled or no window selected, close application
+                PostMessage(hWnd, WM_CLOSE, 0, 0);
             }
-            
-            EndPaint(hWnd, &ps);
+        }
+        break;
+    case WM_SIZE:
+        {
+            // Update thumbnail properties when window size changes
+            if (g_hThumbnail != NULL && g_hSourceWnd != NULL)
+            {
+                UpdateThumbnailProperties(hWnd, g_hThumbnail, g_hSourceWnd);
+            }
         }
         break;
     case WM_DESTROY:
-        if (g_timerId != 0)
         {
-            KillTimer(hWnd, g_timerId);
+            if (g_hThumbnail != NULL)
+            {
+                DwmUnregisterThumbnail(g_hThumbnail);
+                g_hThumbnail = NULL;
+            }
+            PostQuitMessage(0);
         }
-        PostQuitMessage(0);
         break;
     default:
         return DefWindowProc(hWnd, message, wParam, lParam);
@@ -200,126 +172,217 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
-// Callback function for EnumDisplayMonitors
-BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM dwData)
+// Window enumeration callback
+BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam)
 {
-    static int monitorIndex = 0;
-    RECT* pFirstDisplayRect = (RECT*)dwData;
+    // Ignore invisible windows
+    if (!IsWindowVisible(hWnd))
+        return TRUE;
+
+    // Get window title
+    WCHAR szWindowText[1024] = {0};
+    GetWindowTextW(hWnd, szWindowText, ARRAYSIZE(szWindowText) - 1);
     
-    monitorIndex++;
+    // Ignore untitled windows
+    if (wcslen(szWindowText) == 0)
+        return TRUE;
+
+    // Ignore the picker dialog itself and its parent
+    HWND hPickerDlg = (HWND)lParam;
+    if (hWnd == hPickerDlg || hWnd == GetParent(hPickerDlg))
+        return TRUE;
+
+    // Get process information
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hWnd, &processId);
     
-    // Get the 1st monitor (first one found)
-    if (monitorIndex == 1)
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+    if (hProcess == NULL)
+        return TRUE;
+
+    WCHAR szProcessName[MAX_PATH] = {0};
+    DWORD dwSize = ARRAYSIZE(szProcessName);
+    if (QueryFullProcessImageNameW(hProcess, 0, szProcessName, &dwSize))
     {
-        // Get complete monitor information including full screen area
-        MONITORINFO monitorInfo;
-        monitorInfo.cbSize = sizeof(MONITORINFO);
-        
-        if (GetMonitorInfo(hMonitor, &monitorInfo))
+        // Extract process name from full path
+        WCHAR* pszName = wcsrchr(szProcessName, L'\\');
+        if (pszName != NULL)
+            pszName++;
+        else
+            pszName = szProcessName;
+
+        // Ignore certain system processes
+        WCHAR szLowerName[MAX_PATH] = {0};
+        for (int i = 0; pszName[i]; i++)
+            szLowerName[i] = towlower(pszName[i]);
+
+        if (wcscmp(szLowerName, L"applicationframehost.exe") == 0 ||
+            wcscmp(szLowerName, L"shellexperiencehost.exe") == 0 ||
+            wcscmp(szLowerName, L"systemsettings.exe") == 0 ||
+            wcscmp(szLowerName, L"winstore.app.exe") == 0 ||
+            wcscmp(szLowerName, L"searchui.exe") == 0)
         {
-            // Use rcMonitor to get the complete monitor rectangle (not just work area)
-            *pFirstDisplayRect = monitorInfo.rcMonitor;
-            g_bFirstDisplayFound = TRUE;
+            CloseHandle(hProcess);
+            return TRUE;
         }
-        return FALSE; // Stop enumeration
-    }
-    
-    return TRUE; // Continue enumeration
-}
 
-// Function to get 1st display monitor information
-BOOL GetFirstDisplayInfo(RECT* pRect)
-{
-    if (pRect == NULL)
-        return FALSE;
-    
-    g_bFirstDisplayFound = FALSE;
-    
-    // Enumerate all monitors
-    EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, (LPARAM)pRect);
-    
-    return g_bFirstDisplayFound;
-}
+        // Add window to list
+        CapturableWindow window;
+        window.hWnd = hWnd;
+        window.name = std::wstring(szWindowText) + L" (" + std::wstring(pszName) + L")";
+        g_windowsList.push_back(window);
+    }
 
-// Function to capture screen from specified rectangle
-BOOL CaptureScreen(HWND hWnd, HDC hdcDest, RECT* pSourceRect)
-{
-    if (pSourceRect == NULL || hWnd == NULL)
-        return FALSE;
-    
-    // Calculate source dimensions - ensure we get the whole display
-    int sourceWidth = pSourceRect->right - pSourceRect->left;
-    int sourceHeight = pSourceRect->bottom - pSourceRect->top;
-    
-    if (sourceWidth <= 0 || sourceHeight <= 0)
-        return FALSE;
-    
-    // Get screen DC for the entire virtual screen
-    HDC hdcScreen = GetDC(NULL);
-    if (hdcScreen == NULL)
-        return FALSE;
-    
-    // Create compatible DC and bitmap with exact source dimensions
-    HDC hdcMem = CreateCompatibleDC(hdcScreen);
-    if (hdcMem == NULL)
-    {
-        ReleaseDC(NULL, hdcScreen);
-        return FALSE;
-    }
-    
-    // Create bitmap with the exact size of the source display
-    HBITMAP hBitmap = CreateCompatibleBitmap(hdcScreen, sourceWidth, sourceHeight);
-    if (hBitmap == NULL)
-    {
-        DeleteDC(hdcMem);
-        ReleaseDC(NULL, hdcScreen);
-        return FALSE;
-    }
-    
-    // Select bitmap into memory DC
-    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hdcMem, hBitmap);
-    
-    // Copy the entire screen content from the source rectangle
-    // This captures the whole 2nd display area pixel by pixel
-    BOOL bResult = BitBlt(hdcMem, 
-                         0, 0,                    // Destination: start at top-left
-                         sourceWidth, sourceHeight, // Full source dimensions
-                         hdcScreen, 
-                         pSourceRect->left,       // Source: X coordinate of 2nd display
-                         pSourceRect->top,        // Source: Y coordinate of 2nd display
-                         SRCCOPY);                // Copy entire area
-    
-    if (!bResult)
-    {
-        SelectObject(hdcMem, hOldBitmap);
-        DeleteObject(hBitmap);
-        DeleteDC(hdcMem);
-        ReleaseDC(NULL, hdcScreen);
-        return FALSE;
-    }
-    
-    // Get client rect for destination window
-    RECT clientRect;
-    GetClientRect(hWnd, &clientRect);
-    int destWidth = clientRect.right - clientRect.left;
-    int destHeight = clientRect.bottom - clientRect.top;
-    
-    // Stretch the captured bitmap to fit the window while maintaining aspect ratio
-    // Use HALFTONE for better quality when stretching
-    SetStretchBltMode(hdcDest, HALFTONE);
-    SetBrushOrgEx(hdcDest, 0, 0, NULL);
-    
-    // Copy the entire captured content to the destination
-    StretchBlt(hdcDest, 0, 0, destWidth, destHeight,
-               hdcMem, 0, 0, sourceWidth, sourceHeight,
-               SRCCOPY);
-    
-    // Cleanup
-    SelectObject(hdcMem, hOldBitmap);
-    DeleteObject(hBitmap);
-    DeleteDC(hdcMem);
-    ReleaseDC(NULL, hdcScreen);
-    
+    CloseHandle(hProcess);
     return TRUE;
 }
 
+// Get DPI scale factor for a window
+FLOAT GetDpiScaleFactor(HWND hWnd)
+{
+    HDC hdc = GetDC(hWnd);
+    if (hdc == NULL)
+        return 1.0f;
+
+    FLOAT dpi = (FLOAT)GetDeviceCaps(hdc, LOGPIXELSX);
+    ReleaseDC(hWnd, hdc);
+    
+    return dpi / 96.0f;
+}
+
+// Update thumbnail properties
+void UpdateThumbnailProperties(HWND hWnd, HTHUMBNAIL hThumbnail, HWND hSourceWnd)
+{
+    if (hThumbnail == NULL)
+        return;
+
+    FLOAT dpiScale = GetDpiScaleFactor(hWnd);
+    
+    // Get client size
+    RECT clientRect;
+    GetClientRect(hWnd, &clientRect);
+    
+    int width = (int)((clientRect.right - clientRect.left) * dpiScale);
+    int height = (int)((clientRect.bottom - clientRect.top) * dpiScale);
+
+    DWM_THUMBNAIL_PROPERTIES props = {0};
+    props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_RECTDESTINATION | DWM_TNP_SOURCECLIENTAREAONLY;
+    props.fVisible = TRUE;
+    props.opacity = 255;
+    props.fSourceClientAreaOnly = TRUE;
+    props.rcDestination.left = 0;
+    props.rcDestination.top = 0;
+    props.rcDestination.right = width;
+    props.rcDestination.bottom = height;
+
+    HRESULT hr = DwmUpdateThumbnailProperties(hThumbnail, &props);
+    if (FAILED(hr))
+    {
+        // Handle error if needed
+    }
+}
+
+// Window picker dialog procedure
+INT_PTR CALLBACK WindowPickerDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    UNREFERENCED_PARAMETER(lParam);
+
+    switch (message)
+    {
+    case WM_INITDIALOG:
+        {
+            // Clear previous list
+            g_windowsList.clear();
+            
+            // Get dialog handle for enumeration
+            HWND hList = GetDlgItem(hDlg, IDC_LIST_WINDOWS);
+            HWND hOwner = GetParent(hDlg);
+            
+            // Enumerate windows (pass dialog handle to ignore it)
+            EnumWindows(EnumWindowsProc, (LPARAM)hDlg);
+            
+            // Populate list box
+            for (size_t i = 0; i < g_windowsList.size(); i++)
+            {
+                int index = (int)SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)g_windowsList[i].name.c_str());
+                SendMessageW(hList, LB_SETITEMDATA, index, (LPARAM)g_windowsList[i].hWnd);
+            }
+            
+            // Select first item if available
+            if (g_windowsList.size() > 0)
+            {
+                SendMessageW(hList, LB_SETCURSEL, 0, 0);
+            }
+            
+            return (INT_PTR)TRUE;
+        }
+    case WM_COMMAND:
+        {
+            int wmId = LOWORD(wParam);
+            int wmEvent = HIWORD(wParam);
+            
+            if (wmId == IDOK)
+            {
+                HWND hList = GetDlgItem(hDlg, IDC_LIST_WINDOWS);
+                int sel = (int)SendMessageW(hList, LB_GETCURSEL, 0, 0);
+                
+                if (sel != LB_ERR)
+                {
+                    g_hSelectedWindow = (HWND)SendMessageW(hList, LB_GETITEMDATA, sel, 0);
+                    EndDialog(hDlg, IDOK);
+                }
+                else
+                {
+                    g_hSelectedWindow = NULL;
+                    EndDialog(hDlg, IDCANCEL);
+                }
+                
+                return (INT_PTR)TRUE;
+            }
+            
+            if (wmId == IDC_LIST_WINDOWS && wmEvent == LBN_DBLCLK)
+            {
+                // Double-click on list item - treat as OK
+                HWND hList = GetDlgItem(hDlg, IDC_LIST_WINDOWS);
+                int sel = (int)SendMessageW(hList, LB_GETCURSEL, 0, 0);
+                
+                if (sel != LB_ERR)
+                {
+                    g_hSelectedWindow = (HWND)SendMessageW(hList, LB_GETITEMDATA, sel, 0);
+                    EndDialog(hDlg, IDOK);
+                }
+                
+                return (INT_PTR)TRUE;
+            }
+            
+            if (wmId == IDCANCEL)
+            {
+                g_hSelectedWindow = NULL;
+                EndDialog(hDlg, IDCANCEL);
+                return (INT_PTR)TRUE;
+            }
+        }
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
+
+// Pick capture target window
+BOOL PickCaptureTarget(HWND hOwnerWnd, HWND* phSelectedWnd)
+{
+    if (phSelectedWnd == NULL)
+        return FALSE;
+
+    *phSelectedWnd = NULL;
+    g_hSelectedWindow = NULL;
+
+    INT_PTR result = DialogBox(hInst, MAKEINTRESOURCE(IDD_WINDOWPICKER), hOwnerWnd, WindowPickerDlgProc);
+    
+    if (result == IDOK && g_hSelectedWindow != NULL)
+    {
+        *phSelectedWnd = g_hSelectedWindow;
+        return TRUE;
+    }
+
+    return FALSE;
+}
