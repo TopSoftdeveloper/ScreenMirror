@@ -275,6 +275,7 @@ void UpdateThumbnailProperties(HWND hWnd, HTHUMBNAIL hThumbnail, HWND hSourceWnd
     props.rcDestination.right = width;
     props.rcDestination.bottom = height;
 
+    // DwmUpdateThumbnailProperties expects const pointer
     HRESULT hr = DwmUpdateThumbnailProperties(hThumbnail, &props);
     if (FAILED(hr))
     {
